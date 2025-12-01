@@ -1,0 +1,26 @@
+dataset_params:
+  dataset: 'imagenet'
+  img_size: 224
+  batch_size: 256
+  num_workers: 8
+  data_path: ""
+
+model:
+  seed: 61
+  optim_params:
+    learning_rate: 0.05
+    b1: 0.9
+    b2: 0.999
+    weight_decay: 1e-4
+    eps: 1e-8
+  params:
+      dim: 2048
+      pred_dim: 512
+      out_dim: 2048
+  checkpoint_path: /content/drive/MyDrive/SimSiam/simsiam.pkl
+  epochs: 100
+  ema_decay: 0.999
+
+wandb:
+  project: 'SimSiam'
+  name: 'SimSiam imagenet'
