@@ -1,25 +1,25 @@
 dataset_params:
   dataset: 'imagenet'
   img_size: 224
-  batch_size: 256
+  batch_size: 2048
   num_workers: 8
-  data_path: ""
+  data_path: /dev/shm/imagenet/train
+  val_data_path: /dev/shm/imagenet/val
 
 model:
   seed: 61
   optim_params:
     learning_rate: 0.05
-    b1: 0.9
-    b2: 0.999
-    weight_decay: 1e-4
-    eps: 1e-8
+    momentum: 0.9
+    weight_decay: 0.0001
   params:
       dim: 2048
       pred_dim: 512
       out_dim: 2048
-  checkpoint_path: /content/drive/MyDrive/SimSiam/simsiam.pkl
+  num_classes: 1000
+  checkpoint_path: /home/muhammetcan/checkpoints/simsiam.pkl
+  linear_eval_checkpoint_path: /home/muhammetcan/checkpoints/lineareval.pkl
   epochs: 100
-  ema_decay: 0.999
 
 wandb:
   project: 'SimSiam'
