@@ -28,18 +28,34 @@ def load_checkpoint(path, state_template):
         return serialization.from_bytes(state_template, f.read())
 
 
-def map_params_to_label(path, _):
-    path_names = [str(p.key) if hasattr(p, 'key') else str(p) for p in path]
-    full_path_str = '/'.join(path_names).lower()
-    is_predictor = 'predictor' in full_path_str
-    is_no_decay = any(name in ('bias', 'scale') for name in path_names)
-    if is_predictor:
-        return 'predictor_nodecay' if is_no_decay else 'predictor_decay'
-    else:
-        return 'backbone_nodecay' if is_no_decay else 'backbone_decay'
+def create_lr_schedule_fn(init_lr, total_steps, fix_pred_lr=True):
+    backbone_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=init_lr,
+        warmup_steps=int(0.1 * total_steps),
+        decay_steps=total_steps,
+        end_value=0.0
+    )
+
+    predictor_schedule = optax.constant_schedule(init_lr)
+
+    def lr_fn(step, params):
+        backbone_lr = backbone_schedule(step)
+        predictor_lr = predictor_schedule(step)
+
+        def get_lr_for_param(path, _):
+            path_names = [str(p.key) if hasattr(p, 'key') else str(p) for p in path]
+            full_path_str = '/'.join(path_names).lower()
+            if fix_pred_lr and 'predictor' in full_path_str:
+                return predictor_lr
+            return backbone_lr
+
+        return jax.tree_util.tree_map_with_path(get_lr_for_param, params)
+
+    return lr_fn
 
 
-def make_update_fn(*, apply_fn, lr_schedule, momentum, weight_decay):
+def make_update_fn(*, apply_fn, lr_fn, momentum, weight_decay):
     def update_fn(params, batch_stats, opt_state, x1, x2, step):
         def loss_fn(params):
             (p1, p2, z1, z2), new_batch_stats = apply_fn(
@@ -64,32 +80,32 @@ def make_update_fn(*, apply_fn, lr_schedule, momentum, weight_decay):
         loss = jax.lax.pmean(loss, axis_name='batch')
         grad = jax.lax.pmean(grad, axis_name='batch')
 
-        lr = lr_schedule(step)
+        lr_tree = lr_fn(step, params)
 
         new_opt_state = jax.tree_util.tree_map(
             lambda m, g: momentum * m + g,
             opt_state, grad
         )
 
-        param_labels = jax.tree_util.tree_map_with_path(map_params_to_label, params)
+        def apply_update(path, param, mom, lr):
+            path_names = [str(p.key) if hasattr(p, 'key') else str(p) for p in path]
+            is_no_decay = any(name in ('bias', 'scale') for name in path_names)
 
-        def apply_update(label, param, mom):
-            if 'predictor_decay' in label:
-                wd = weight_decay * 10.0
-            elif 'backbone_decay' in label:
-                wd = weight_decay
-            else:
+            if is_no_decay:
                 wd = 0.0
+            else:
+                wd = weight_decay
+
             return param - lr * (mom + wd * param)
 
-        new_params = jax.tree_util.tree_map(
+        new_params = jax.tree_util.tree_map_with_path(
             apply_update,
-            param_labels, params, new_opt_state
+            params, new_opt_state, lr_tree
         )
 
         return new_params, new_batch_stats, new_opt_state, loss
 
-    return jax.pmap(update_fn, axis_name='batch', donate_argnums=())
+    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2))
 
 
 def main(config_path):
@@ -134,6 +150,8 @@ def main(config_path):
         num_workers=dataset_config['num_workers'],
         pin_memory=False,
         drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=dataset_config['prefetch_factor'],
     )
 
     simsiam = SimSiam(**simsiam_config['params'])
@@ -161,17 +179,16 @@ def main(config_path):
     total_steps = steps_per_epoch * simsiam_config['epochs']
 
     init_lr = simsiam_config['optim_params']['learning_rate'] * dataset_config['batch_size'] / 256
-
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=init_lr,
-        warmup_steps=10 * steps_per_epoch,
-        decay_steps=total_steps,
-        end_value=0.0
-    )
-
     wd = simsiam_config['optim_params']['weight_decay']
     momentum = simsiam_config['optim_params']['momentum']
+
+    fix_pred_lr = simsiam_config['optim_params'].get('fix_pred_lr', True)
+
+    lr_fn = create_lr_schedule_fn(
+        init_lr=init_lr,
+        total_steps=total_steps,
+        fix_pred_lr=fix_pred_lr
+    )
 
     replicate = lambda tree: jax.device_put_replicated(tree, jax.local_devices())
     unreplicate = lambda tree: jax.tree_util.tree_map(lambda x: x[0], tree)
@@ -180,7 +197,7 @@ def main(config_path):
 
     update_fn = make_update_fn(
         apply_fn=simsiam.apply,
-        lr_schedule=lr_schedule,
+        lr_fn=lr_fn,
         momentum=momentum,
         weight_decay=wd,
     )
@@ -209,7 +226,7 @@ def main(config_path):
         batch_stats_repl = replicate(loaded_state['batch_stats'])
         opt_state_repl = replicate(loaded_state['opt_state'])
         start_epoch = loaded_state['epoch'] + 1
-        global_step = loaded_state["global_step"] * start_epoch
+        global_step = start_epoch * steps_per_epoch
 
     def shard(x):
         n, *s = x.shape
