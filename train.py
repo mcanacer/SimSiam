@@ -273,7 +273,7 @@ def main(config_path):
             "params": unreplicate(params_repl),
             "batch_stats": unreplicate(batch_stats_repl),
             "opt_state": unreplicate(opt_state_repl),
-            "epoch": epoch,
+            "epoch": epoch + 1,
         })
 
 

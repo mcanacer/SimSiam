@@ -1,4 +1,5 @@
 import sys
+
 import yaml
 import os
 
@@ -6,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import serialization
+import flax.linen as nn
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
@@ -13,7 +15,7 @@ import wandb
 
 import numpy as np
 
-from linear_model import LinearModel
+from encoder import ResNet50
 
 
 def save_checkpoint(path, state):
@@ -28,16 +30,21 @@ def load_checkpoint(path, state_template):
         return serialization.from_bytes(state_template, f.read())
 
 
-def make_update_fn(*, apply_fn, optimizer):
-    def update_fn(params, batch_stats, opt_state, inputs, labels):
+def make_update_fn(*, encoder_apply_fn, classifier_apply_fn, optimizer):
+    def update_fn(params, resnet_params, resnet_batch_stats, opt_state, inputs, labels):
+        features = encoder_apply_fn(
+            {
+                "params": resnet_params,
+                "batch_stats": resnet_batch_stats,
+            },
+            inputs,
+            train=False,
+        )
+
+        features = jax.lax.stop_gradient(features)
+
         def loss_fn(params):
-            logits = apply_fn(
-                {
-                    "params": params,
-                    "batch_stats": batch_stats,
-                },
-                inputs
-            )
+            logits = classifier_apply_fn(params, features)
 
             loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
 
@@ -51,14 +58,22 @@ def make_update_fn(*, apply_fn, optimizer):
         updates, opt_state = optimizer.update(grad, opt_state, params)
         params = optax.apply_updates(params, updates)
 
-        return params, opt_state, loss
+        return params, opt_state, loss, logits
 
-    return jax.pmap(update_fn, axis_name='batch', donate_argnums=())
+    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 3))
 
 
-def make_predict_fn(*, apply_fn):
-    def predict_fn(params, batch_stats, inputs):
-        return apply_fn({"params": params, "batch_stats": batch_stats}, inputs)
+def make_predict_fn(*, encoder_apply_fn, classifier_apply_fn):
+    def predict_fn(params, resnet_params, resnet_batch_stats, inputs):
+        features = encoder_apply_fn(
+            {
+                "params": resnet_params,
+                "batch_stats": resnet_batch_stats,
+            },
+            inputs,
+            train=False,
+        )
+        return classifier_apply_fn(params, features)
     return jax.pmap(predict_fn, axis_name='batch', donate_argnums=())
 
 
@@ -78,7 +93,7 @@ def main(config_path):
 
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         transforms.Lambda(lambda x: x.permute(1, 2, 0)),  # Convert [C, H, W] to [H, W, C]
@@ -112,6 +127,8 @@ def main(config_path):
         num_workers=dataset_config['num_workers'],
         pin_memory=False,
         drop_last=True,
+        prefetch_factor=dataset_config['prefetch_factor'],
+        persistent_workers=True,
     )
 
     val_loader = DataLoader(
@@ -122,11 +139,15 @@ def main(config_path):
         drop_last=True,
     )
 
-    model = LinearModel(
-        num_classes=simsiam_config['num_classes'],
+    encoder = ResNet50()
+
+    classifier = nn.Dense(
+        simsiam_config['num_classes'],
+        kernel_init=nn.initializers.truncated_normal(stddev=0.01),
+        bias_init=nn.initializers.zeros,
     )
 
-    epochs = simsiam_config['epochs']
+    epochs = simsiam_config['linear_epochs']
 
     run = wandb.init(
         project=wandb_config['project'],
@@ -143,14 +164,8 @@ def main(config_path):
     resnet_params = pretrained_variables["params"]["encoder"]["ResNet_50_0"]
     resnet_batch_stats = pretrained_variables["batch_stats"]["encoder"]["ResNet_50_0"]
 
-    inputs, _ = next(iter(train_loader))
-
     key = jax.random.PRNGKey(seed)
-    variables = model.init(key, inputs)
-
-    params, batch_stats = variables['params'].unfreeze(), variables['batch_stats'].unfreeze()
-    params["backbone"] = resnet_params
-    batch_stats["backbone"] = resnet_batch_stats
+    params = classifier.init(key, jnp.ones((2, 2048)))
 
     init_lr = simsiam_config['optim_params']['learning_rate'] * dataset_config['batch_size'] / 256
 
@@ -162,16 +177,19 @@ def main(config_path):
     unreplicate = lambda tree: jax.tree_util.tree_map(lambda x: x[0], tree)
 
     update_fn = make_update_fn(
-        apply_fn=model.apply,
+        encoder_apply_fn=encoder.apply,
+        classifier_apply_fn=classifier.apply,
         optimizer=optimizer,
     )
 
     predict_fn = make_predict_fn(
-        apply_fn=model.apply,
+        encoder_apply_fn=encoder.apply,
+        classifier_apply_fn=classifier.apply,
     )
 
     params_repl = replicate(params)
-    batch_stats_repl = replicate(batch_stats)
+    resnet_params_repl = replicate(resnet_params)
+    resnet_batch_stats_repl = replicate(resnet_batch_stats)
     opt_state_repl = replicate(opt_state)
 
     state_template = {
@@ -181,9 +199,9 @@ def main(config_path):
     }
 
     del params
-    del batch_stats
+    del resnet_params
+    del resnet_batch_stats
     del opt_state
-    del variables
 
     loaded_state = load_checkpoint(linear_eval_checkpoint_path, state_template)
     start_epoch = 0
@@ -210,10 +228,12 @@ def main(config_path):
             (
                 params_repl,
                 opt_state_repl,
-                loss
+                loss,
+                logits,
             ) = update_fn(
                 params_repl,
-                batch_stats_repl,
+                resnet_params_repl,
+                resnet_batch_stats_repl,
                 opt_state_repl,
                 images,
                 labels,
@@ -221,10 +241,17 @@ def main(config_path):
 
             loss = unreplicate(loss)
 
+            logits = unshard(logits)  # [N, C]
+            labels = unshard(labels)  # [N]
+
+            predictions = jnp.argmax(logits, axis=-1)  # [N]
+            accuracy = jnp.mean(predictions == labels)
+
             print("Epoch: {} Step: {} Loss: {:.4f}".format(epoch, step, float(loss)))
 
             run.log({
                 "loss": loss,
+                "train_accuracy": accuracy,
                 "epoch": epoch,
             })
 
@@ -233,8 +260,8 @@ def main(config_path):
             images = jax.tree_util.tree_map(lambda x: shard(np.array(x)), images)
             labels_np = labels.numpy()
 
-            logits_repl = predict_fn(params_repl, batch_stats_repl, images)
-            logits = jax.tree_util.tree_map(lambda x: unshard(np.array(x)), logits_repl)
+            logits_repl = predict_fn(params_repl, resnet_params_repl, resnet_batch_stats_repl, images)
+            logits = unshard(logits_repl)
 
             predictions = logits.argmax(axis=-1)
             accuracy = jnp.mean(predictions == labels_np)
@@ -245,7 +272,7 @@ def main(config_path):
         save_checkpoint(linear_eval_checkpoint_path, {
             "params": unreplicate(params_repl),
             "opt_state": unreplicate(opt_state_repl),
-            "epoch": epoch,
+            "epoch": epoch + 1,
         })
 
 
